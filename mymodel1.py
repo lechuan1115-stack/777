@@ -25,6 +25,10 @@ PERTURB_ORDER = ['CFO', 'SCALE', 'GAIN', 'SHIFT', 'CHIRP']
 N_PERT = len(PERTURB_ORDER)
 
 
+def _global_pool(feat: torch.Tensor) -> torch.Tensor:
+    return nn.AdaptiveAvgPool2d((1, 1))(feat).view(feat.size(0), -1)
+
+
 # ------------------------------
 # 基础模块：1×k 的时序卷积块
 # ------------------------------
@@ -210,15 +214,314 @@ class CNNTransformerNet(PerturbBranchMixin, nn.Module):
 
 
 
+# ------------------------------
+# 对比模型：纯 CNN（对比1）
+# ------------------------------
+class CNNBaseline(nn.Module):
+    def __init__(self, n_classes: int):
+        super().__init__()
+        self.stem = nn.Sequential(
+            Conv2dBlock(2, 32, 7, pool=True),
+            Conv2dBlock(32, 64, 5, pool=True),
+            Conv2dBlock(64, 128, 3, pool=True),
+            Conv2dBlock(128, 256, 3, pool=True),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, x, z=None, s=None):
+        feat = self.stem(x)
+        feat = _global_pool(feat)
+        logits = self.head(feat)
+        return logits, feat, None, None
+
+
+# ------------------------------
+# 对比模型：CVCNN（对比2）
+# ------------------------------
+class CVCNN(nn.Module):
+    def __init__(self, n_classes: int):
+        super().__init__()
+        self.complex_conv = nn.Sequential(
+            nn.Conv2d(2, 32, kernel_size=(1, 5), padding=(0, 2), groups=2, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=(1, 3), padding=(0, 1), bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.AvgPool2d(kernel_size=(1, 2)),
+            nn.Conv2d(64, 128, kernel_size=(1, 3), padding=(0, 1), bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.AvgPool2d(kernel_size=(1, 2)),
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(64, n_classes),
+        )
+
+    def forward(self, x, z=None, s=None):
+        feat = self.complex_conv(x)
+        feat = _global_pool(feat)
+        logits = self.classifier(feat)
+        return logits, feat, None, None
+
+
+# ------------------------------
+# 对比模型：RSBU-LSTM（对比3）
+# ------------------------------
+class RSBU_LSTM(nn.Module):
+    def __init__(self, n_classes: int, hidden_size: int = 128):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            Conv2dBlock(2, 32, 7, pool=True),
+            Conv2dBlock(32, 64, 5, pool=True),
+        )
+        self.lstm = nn.LSTM(
+            input_size=64,
+            hidden_size=hidden_size,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.2,
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size * 2, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, x, z=None, s=None):
+        feat = self.cnn(x)
+        seq = feat.squeeze(2).permute(0, 2, 1)
+        lstm_out, _ = self.lstm(seq)
+        feat_flat = lstm_out[:, -1, :]
+        logits = self.classifier(feat_flat)
+        return logits, feat_flat, None, None
+
+
+# ------------------------------
+# 对比模型：CLDNN（对比4）
+# ------------------------------
+class CLDNN(nn.Module):
+    def __init__(self, n_classes: int, lstm_hidden: int = 128):
+        super().__init__()
+        self.conv = nn.Sequential(
+            Conv2dBlock(2, 32, 7, pool=True),
+            Conv2dBlock(32, 64, 5, pool=True),
+            Conv2dBlock(64, 128, 3, pool=True),
+        )
+        self.lstm = nn.LSTM(
+            input_size=128,
+            hidden_size=lstm_hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.dense = nn.Sequential(
+            nn.Linear(lstm_hidden * 2, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, x, z=None, s=None):
+        feat = self.conv(x)
+        seq = feat.squeeze(2).permute(0, 2, 1)
+        out, _ = self.lstm(seq)
+        feat_flat = out[:, -1, :]
+        logits = self.dense(feat_flat)
+        return logits, feat_flat, None, None
+
+
+# ------------------------------
+# 对比模型：MCLDNN（对比5）
+# ------------------------------
+class MCLDNN(nn.Module):
+    def __init__(self, n_classes: int, lstm_hidden: int = 128):
+        super().__init__()
+        self.branch3 = nn.Sequential(
+            Conv2dBlock(2, 32, 3, pool=True),
+            Conv2dBlock(32, 64, 3, pool=True),
+        )
+        self.branch5 = nn.Sequential(
+            Conv2dBlock(2, 32, 5, pool=True),
+            Conv2dBlock(32, 64, 5, pool=True),
+        )
+        self.branch7 = nn.Sequential(
+            Conv2dBlock(2, 32, 7, pool=True),
+            Conv2dBlock(32, 64, 7, pool=True),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(64 * 3, 128, kernel_size=(1, 1), bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.lstm = nn.LSTM(
+            input_size=128,
+            hidden_size=lstm_hidden,
+            num_layers=1,
+            bidirectional=True,
+            batch_first=True,
+        )
+        self.head = nn.Sequential(
+            nn.Linear(lstm_hidden * 2, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, x, z=None, s=None):
+        b3 = self.branch3(x)
+        b5 = self.branch5(x)
+        b7 = self.branch7(x)
+        min_len = min(b3.size(-1), b5.size(-1), b7.size(-1))
+        b3 = b3[..., :min_len]
+        b5 = b5[..., :min_len]
+        b7 = b7[..., :min_len]
+        feat = torch.cat([b3, b5, b7], dim=1)
+        feat = self.fuse(feat)
+        seq = feat.squeeze(2).permute(0, 2, 1)
+        out, _ = self.lstm(seq)
+        feat_flat = out[:, -1, :]
+        logits = self.head(feat_flat)
+        return logits, feat_flat, None, None
+
+
+# ------------------------------
+# 对比模型：ResNet18（对比6）
+# ------------------------------
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=(1, 3), stride=(1, stride), padding=(0, 1), bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=(1, 3), stride=1, padding=(0, 1), bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=(1, stride), bias=False),
+                nn.BatchNorm2d(planes),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class ResNet18(nn.Module):
+    def __init__(self, n_classes: int):
+        super().__init__()
+        self.in_planes = 32
+        self.conv1 = nn.Conv2d(2, 32, kernel_size=(1, 7), stride=(1, 2), padding=(0, 3), bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.layer1 = self._make_layer(32, 2, stride=1)
+        self.layer2 = self._make_layer(64, 2, stride=2)
+        self.layer3 = self._make_layer(128, 2, stride=2)
+        self.layer4 = self._make_layer(256, 2, stride=2)
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(128, n_classes),
+        )
+
+    def _make_layer(self, planes, blocks, stride):
+        layers = [BasicBlock(self.in_planes, planes, stride=stride)]
+        self.in_planes = planes * BasicBlock.expansion
+        for _ in range(1, blocks):
+            layers.append(BasicBlock(self.in_planes, planes))
+        return nn.Sequential(*layers)
+
+    def forward(self, x, z=None, s=None):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        feat = _global_pool(out)
+        logits = self.classifier(feat)
+        return logits, feat, None, None
+
+
+# ------------------------------
+# 对比模型：ResNet-LSTM（对比7）
+# ------------------------------
+class ResNetLSTM(nn.Module):
+    def __init__(self, n_classes: int, lstm_hidden: int = 128):
+        super().__init__()
+        self.backbone = ResNet18(n_classes=n_classes)
+        self.backbone.classifier = nn.Identity()
+        self.lstm = nn.LSTM(
+            input_size=256,
+            hidden_size=lstm_hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.head = nn.Sequential(
+            nn.Linear(lstm_hidden * 2, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, x, z=None, s=None):
+        out = F.relu(self.backbone.bn1(self.backbone.conv1(x)))
+        out = self.backbone.layer1(out)
+        out = self.backbone.layer2(out)
+        out = self.backbone.layer3(out)
+        out = self.backbone.layer4(out)
+        seq = out.squeeze(2).permute(0, 2, 1)
+        lstm_out, _ = self.lstm(seq)
+        feat = lstm_out[:, -1, :]
+        logits = self.head(feat)
+        return logits, feat, None, None
 
 
 # ------------------------------
 # 工厂：只保留“perturbawarenet”一个名字
 # ------------------------------
 def create(name: str, num_classes: int, fs: float = 50e6, **kwargs) -> nn.Module:
-    key = (name or "").strip().lower()
+    def _normalize(n: str) -> str:
+        n = (n or "").lower()
+        n = n.translate(str.maketrans('', '', '（）() -_'))
+        return n
+
+    key = _normalize(name)
     if key == "perturbawarenet":
         return PerturbAwareNet(n_classes=num_classes, fs=fs)
     if key == "cnn_transformer":
         return CNNTransformerNet(n_classes=num_classes, fs=fs, **kwargs)
+    mapping = {
+        "cnn对比1": CNNBaseline,
+        "cvcnn对比2": CVCNN,
+        "rsbulstm对比3": RSBU_LSTM,
+        "cldnn对比4": CLDNN,
+        "mcldnn对比5": MCLDNN,
+        "resnet18对比6": ResNet18,
+        "resnetlstm对比7": ResNetLSTM,
+        "cnn": CNNBaseline,
+        "cvcnn": CVCNN,
+        "rsbulstm": RSBU_LSTM,
+        "cldnn": CLDNN,
+        "mcldnn": MCLDNN,
+        "resnet18": ResNet18,
+        "resnetlstm": ResNetLSTM,
+    }
+    if key in mapping:
+        return mapping[key](n_classes=num_classes)
     raise KeyError(f"Unsupported model name: {name}")
