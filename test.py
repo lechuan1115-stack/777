@@ -358,43 +358,6 @@ def evaluate_perturb_metrics(model, loader, device, cfg):
 
 
 @torch.no_grad()
-def evaluate_perturb_metrics(model, loader, device, cfg):
-    model.eval()
-    z_acc_meter = AverageMeter()
-    mae_meter = AverageMeter()
-    mse_meter = AverageMeter()
-    for batch in loader:
-        x, _, z_true, s_true = batch
-        x = x.to(device)
-        z_true = z_true.to(device)
-        s_true = s_true.to(device)
-        z_logit, s_pred = None, None
-        if _model_supports_perturb_heads(model):
-            red_fn = getattr(model, "_x_as_32ch")
-            reducer = getattr(model, "_perturb_reducer")
-            z_head = getattr(model, "z_head")
-            s_head = getattr(model, "s_head")
-            red = reducer(red_fn(x))
-            red = red.view(red.size(0), -1)
-            z_logit = z_head(red)
-            s_pred = s_head(red)
-
-        if z_logit is None or s_pred is None:
-            continue
-        z_acc, mae, mse = summarize_perturb_metrics(z_true, s_true, z_logit, s_pred, cfg.z_thresh)
-        bs = z_true.size(0)
-        z_acc_meter.update(z_acc, bs)
-        if not np.isnan(mae):
-            mae_meter.update(mae, int((z_true > 0.5).sum().item()))
-            mse_meter.update(mse, int((z_true > 0.5).sum().item()))
-    return {
-        "z_acc": z_acc_meter.avg if z_acc_meter.count else float("nan"),
-        "s_mae": mae_meter.avg if mae_meter.count else float("nan"),
-        "s_mse": mse_meter.avg if mse_meter.count else float("nan"),
-    }
-
-
-@torch.no_grad()
 def test_and_visualize(model, loader, device, cfg, save_dir, class_names=None):
     model.eval()
     y_true, y_pred = [], []
@@ -451,137 +414,68 @@ def plot_curves(histories, out_path):
 
 # ============= 主流程 =============
 def run(cfg, device):
-    print("程序：cnn_transformer（联合训练：分类 + 扰动分类 + 扰动参数）")
+    print("程序：单模型训练/评估")
     print(f"数据路径：{cfg.data}")
     print(f"保存目录：{cfg.save_root}")
     print(f"模型：{cfg.model_name}")
     os.makedirs(cfg.save_root, exist_ok=True)
     cfg.split_seed = cfg.split_seed if cfg.split_seed is not None else DEFAULT_SPLIT_SEED
 
-    # 1) 读取数据（严格匹配你生成的数据结构）
     X, Y, Z, S, fs, snr_db, noise_var, order = mydata_read.load_adsb_aug5_strict(cfg.data, shuffle=False, seed=cfg.seed)
-    Y = Y.astype(np.int64)  # 明确整数标签
+    Y = Y.astype(np.int64)
 
-    # 类别检查
     uniq = np.unique(Y); print("[CHECK] classes in data =", uniq.tolist())
     assert len(uniq) == cfg.class_num, f"class_num({cfg.class_num}) 与数据({len(uniq)})不一致"
 
-    # 2) 分层划分 80/10/10
-    # 2) 分层随机划分（Stratified Random Split）
     val_ratio = float(getattr(cfg, "val_ratio", 0.10))
     test_ratio = float(getattr(cfg, "test_ratio", 0.10))
     assert 0 < val_ratio < 1 and 0 < test_ratio < 1 and (val_ratio + test_ratio) < 1, "val/test 比例不合法"
-
     tr, va, te, _used_seed = stratified_split_indices(
         Y, val_ratio=val_ratio, test_ratio=test_ratio, split_seed=cfg.split_seed
     )
     print(f"[SPLIT] seed={_used_seed}  sizes: train={len(tr)}  val={len(va)}  test={len(te)}")
-    # 互斥检查
-    st_tr, st_va, st_te = set(tr), set(va), set(te)
-    print("[SPLIT] overlaps:", len(st_tr & st_va), len(st_tr & st_te), len(st_va & st_te))
 
-    # 一定要在循环外创建 Dataset / DataLoader
     train_set = Subset(NumpySignalDataset(X, Y, Z, S), tr)
     val_set = Subset(NumpySignalDataset(X, Y, Z, S), va)
     test_set = Subset(NumpySignalDataset(X, Y, Z, S), te)
-
-    # 可选：保存索引方便复现实验
-    if getattr(cfg, "save_split", True):
-        split_dir = osp.join(cfg.save_root, "split_indices")
-        os.makedirs(split_dir, exist_ok=True)
-        np.save(osp.join(split_dir, "train_idx.npy"), np.array(tr))
-        np.save(osp.join(split_dir, "val_idx.npy"), np.array(va))
-        np.save(osp.join(split_dir, "test_idx.npy"), np.array(te))
-        with open(osp.join(split_dir, "meta.txt"), "w", encoding="utf-8") as f:
-            f.write(f"split_seed={_used_seed}\nval_ratio={val_ratio}\ntest_ratio={test_ratio}\n")
 
     pin = device.type == 'cuda'
     trainloader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True,  num_workers=cfg.workers, pin_memory=pin)
     valloader   = DataLoader(val_set,   batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.workers, pin_memory=pin)
     testloader  = DataLoader(test_set,  batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.workers, pin_memory=pin)
 
-    summarize_zs(trainloader, tag="train")
-    summarize_zs(valloader,  tag="val")
-
-    # 3) 模型
     model = mymodel1.create(name=cfg.model_name, num_classes=cfg.class_num, fs=fs)
     model = model.to(device)
-
-    # 类别权重（按训练集频次）
-    from collections import Counter
-    cnt = Counter([Y[i] for i in tr])
-    freq = np.array([cnt.get(c, 1) for c in range(cfg.class_num)], dtype=np.float32)
-    class_weight = 1.0 / np.maximum(freq, 1.0)
-    class_weight *= (cfg.class_num / class_weight.sum())
-    class_weight = torch.as_tensor(class_weight, dtype=torch.float32, device=device)
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
 
-    # # 4) 训练循环
-    # history = []
-    # best_val = -1e9
-    # best_state = None
-    # t0 = time.time()
-    #
-    # # ===== 早停器初始化（如果 cfg.early_stop=False 就不会启用） =====
-    # stopper = EarlyStopper(
-    #     mode=cfg.es_mode,  # "max" 或 "min"
-    #     min_delta=cfg.es_min_delta,  # 认为“有提升”的最小幅度
-    #     patience=cfg.es_patience,  # 连续多少个 epoch 无提升就停
-    #     warmup=cfg.es_warmup  # 前多少个 epoch 不触发早停
-    # ) if getattr(cfg, "early_stop", False) else None
-    # # ==================================================================
-    #
-    # for epoch in range(cfg.max_epoch):
-    #     print(f"==> Epoch {epoch + 1}/{cfg.max_epoch}")
-    #
-    #     a_tr, l_tr = train_one_epoch(
-    #         model, optimizer, trainloader, device, cfg,
-    #         epoch_idx=epoch, s_mu=s_mu, s_std=s_std
-    #     )
-    #
-    #     a_va, l_va = evaluate(model, valloader, device, cfg)
-    #     print(f"Train_Acc: {a_tr:.2f}%  Val_Acc: {a_va:.2f}%  (loss {l_tr:.4f}/{l_va:.4f})")
-    #
-    #     history.append(dict(epoch=epoch + 1, train_acc=float(a_tr), val_acc=float(a_va)))
-    #
-    #     # 保存“最佳验证准确率”的权重（与早停指标解耦，保持主口径统一）
-    #     if a_va > best_val:
-    #         best_val = a_va
-    #         best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-    #
-    #     # ===== 早停判断（根据 cfg.es_metric 选择 val_acc 或 val_loss） =====
-    #     if stopper is not None:
-    #         current_metric = a_va if cfg.es_metric == "val_acc" else l_va
-    #         should_stop = stopper.step(current_metric, epoch_idx=epoch)
-    #         if should_stop:
-    #             # 防御性打印：best 可能是 None（极端配置/代码修改时）
-    #             best_str = (
-    #                 f"{stopper.best:.4f}" if isinstance(stopper.best, (int, float)) else str(stopper.best)
-    #             )
-    #             print(
-    #                 f"[EARLY STOP] No improvement in {cfg.es_patience} epochs "
-    #                 f"(metric={cfg.es_metric}, best={best_str}). "
-    #                 f"Stop at epoch {epoch + 1}."
-    #             )
-    #             break
-    # elapsed = time.time() - t0
-    # print("训练耗时：", str(datetime.timedelta(seconds=int(elapsed))))
+    history = []
+    best_metric = -1e9
+    best_state = None
+    stopper = EarlyStopper(mode=cfg.es_mode, min_delta=cfg.es_min_delta, patience=cfg.es_patience, warmup=cfg.es_warmup)
 
-    # 保存最好模型
-    ckpt = osp.join(cfg.save_root, f"{cfg.model_name}_best.pt")
-    # torch.save(best_state, ckpt); print("[CKPT] 保存：", ckpt)
+    for epoch in range(cfg.max_epoch):
+        print(f"\n[Epoch {epoch+1}/{cfg.max_epoch}]")
+        train_acc, train_loss = train_one_epoch(model, optimizer, trainloader, device, cfg, epoch)
+        val_acc, val_loss = evaluate(model, valloader, device, cfg)
+        history.append(dict(epoch=epoch + 1, train_acc=train_acc, val_acc=val_acc, train_loss=train_loss, val_loss=val_loss))
 
-    # 5) 评估与可视化
-    model.load_state_dict(torch.load(ckpt, map_location=device))
+        metric = val_acc if cfg.es_metric == "val_acc" else -val_loss
+        if metric > best_metric:
+            best_metric = metric
+            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            torch.save(best_state, osp.join(cfg.save_root, f"{cfg.model_name}_best.pt"))
+            print(f"[CKPT] 更新最佳模型，val_acc={val_acc:.2f}%")
+
+        if stopper.step(metric, epoch_idx=epoch):
+            print(f"[EARLY STOP] {cfg.es_patience} 个周期无提升，提前结束。")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
     acc_val, _ = evaluate(model, valloader, device, cfg)
     test_stats = test_and_visualize(model, testloader, device, cfg, save_dir=cfg.save_root)
     perturb_stats = evaluate_perturb_metrics(model, testloader, device, cfg)
 
-    # 曲线
-    # plot_curves(history, osp.join(cfg.save_root, "train_val_curves.png"))
-
-    # 写 CSV/JSON
     metrics = dict(
         val_acc=float(acc_val),
         test_top1=float(test_stats['top1']),
@@ -605,8 +499,6 @@ def run(cfg, device):
         )
         if write_header: w.writeheader()
         w.writerow({**metrics, "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
-    # with open(osp.join(cfg.save_root, "summary.json"), "w", encoding="utf-8") as f:
-    #     json.dump({"metrics": metrics, "history": history}, f, ensure_ascii=False, indent=2)
 
     print(
         f"Val_Acc: {metrics['val_acc']:.2f}%  TestTop1: {metrics['test_top1']:.2f}%  "
@@ -614,7 +506,6 @@ def run(cfg, device):
         f"TestS_MSE: {metrics['test_s_mse']:.4f}"
     )
     print("[DONE] 结果已写入：", cfg.save_root)
-
 
 def main():
     # ==== 多组实验配置 ====
